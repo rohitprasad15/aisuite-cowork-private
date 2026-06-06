@@ -134,8 +134,8 @@ export function App() {
 
   // Fetch ALL sessions + known projects so the sidebar can group them.
   const refreshSessions = useCallback(() => {
-    getSessions().then(setSessions).catch(() => {});
-    getRecentWorkspaces().then(setProjects).catch(() => {});
+    getSessions().then(setSessions).catch(() => setSessions([]));
+    getRecentWorkspaces().then(setProjects).catch(() => setProjects([]));
   }, []);
 
   // initial: adopt the server's seed workspace if any, else force the gate.
@@ -148,8 +148,11 @@ export function App() {
   // conversation (restores its folder + agent + transcript), else the most recent project
   // folder. Only a true first run (nothing to resume) falls through to the folder gate.
   const resumeLastOrGate = async () => {
+    let loadedSessions: SessionInfo[] = [];
     try {
-      const sess = (await getSessions()).filter((s) => s.session_id && !s.session_id.startsWith("__"));
+      loadedSessions = (await getSessions()).filter((s) => s.session_id && !s.session_id.startsWith("__"));
+      setSessions(loadedSessions);
+      const sess = loadedSessions;
       const ts = (s: SessionInfo) => Date.parse(s.updated_at || "") || Number(s.updated_at) || 0;
       const last = [...sess].sort((a, b) => ts(b) - ts(a))[0];
       if (last) {
@@ -172,6 +175,7 @@ export function App() {
     }
     try {
       const recents = await getRecentWorkspaces();
+      setProjects(recents);
       const ws = recents.find((w) => w.exists) || recents[0];
       if (ws) {
         setWorkspace(ws.path);
