@@ -40,6 +40,49 @@ const COWORK_SUGGESTIONS = [
 ];
 
 const needsWorkspace = (a: string) => a === "code" || a === "cowork";
+const LAST_SESSION_KEY = "coworker:last-session-by-agent:v1";
+
+type LastSession = { sessionId: string; workspace: string; updatedAt: number };
+
+function readLastSessions(): Record<string, LastSession> {
+  try {
+    const raw = localStorage.getItem(LAST_SESSION_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberLastSession(agent: string, sessionId: string, workspace: string | null) {
+  if (!agent || !sessionId) return;
+  try {
+    const all = readLastSessions();
+    all[agent] = { sessionId, workspace: workspace || "", updatedAt: Date.now() };
+    localStorage.setItem(LAST_SESSION_KEY, JSON.stringify(all));
+  } catch {
+    /* localStorage may be unavailable; session restore is best effort. */
+  }
+}
+
+function sessionTs(s: SessionInfo): number {
+  return Date.parse(s.updated_at || "") || Number(s.updated_at) || 0;
+}
+
+function resumeTargetForAgent(agent: string, sessions: SessionInfo[]): LastSession | null {
+  const remembered = readLastSessions()[agent];
+  if (remembered?.sessionId) {
+    const live = sessions.find((s) => s.session_id === remembered.sessionId && s.agent === agent);
+    return {
+      sessionId: remembered.sessionId,
+      workspace: live?.workspace ?? remembered.workspace ?? "",
+      updatedAt: live ? sessionTs(live) : remembered.updatedAt,
+    };
+  }
+  const recent = sessions
+    .filter((s) => s.agent === agent && s.session_id && !s.session_id.startsWith("__"))
+    .sort((a, b) => sessionTs(b) - sessionTs(a))[0];
+  return recent ? { sessionId: recent.session_id, workspace: recent.workspace || "", updatedAt: sessionTs(recent) } : null;
+}
 
 export function App() {
   const [workspace, setWorkspace] = useState<string | null>(null);
@@ -179,6 +222,10 @@ export function App() {
     getSuperagent().then((s) => s?.name && setHelperName(s.name)).catch(() => {});
   }, [refreshSessions]);
 
+  useEffect(() => {
+    if (surface === "session") rememberLastSession(agent, sessionId, workspace);
+  }, [surface, agent, sessionId, workspace]);
+
   // (re)connect when workspace, session, or agent changes
   useEffect(() => {
     if (needsWorkspace(agent) && !workspace) return; // Code/Cowork need a folder (gate handles it)
@@ -291,28 +338,54 @@ export function App() {
   const selectSession = async (id: string, ws: string, ag: string) => {
     setTodo([]);
     setStreaming("");
+    setRunning(false);
     if (ag) setAgent(ag);
     if (!needsWorkspace(ag)) setShowGate(false);
     if (ws && ws !== workspace) {
       setWorkspace(ws); // switch project to the session's folder
       setBranch(null);
     }
+    setSessionId(id);
     try {
       const messages = await getSessionMessages(id);
       setItems(itemsFromMessages(messages));
     } catch {
       setItems([]);
     }
-    setSessionId(id);
   };
-  const switchAgent = (name: string) => {
+  const switchAgent = async (name: string) => {
     setSurface("session");
     if (name === agent) return;
+    rememberLastSession(agent, sessionId, workspace);
+    const knownSessions = sessions.length ? sessions : await getSessions().catch(() => []);
+    const target = resumeTargetForAgent(name, knownSessions);
+
     setAgent(name);
     setItems([]);
     setStreaming("");
     setTodo([]);
-    setSessionId(newId());
+    setRunning(false);
+
+    if (target) {
+      if (target.workspace && target.workspace !== workspace) {
+        setWorkspace(target.workspace);
+        setBranch(null);
+      }
+      if (!needsWorkspace(name)) setShowGate(false);
+      else if (target.workspace) setShowGate(false);
+      else setShowGate(true);
+      setSessionId(target.sessionId);
+      try {
+        setItems(itemsFromMessages(await getSessionMessages(target.sessionId)));
+      } catch {
+        setItems([]);
+      }
+      return;
+    }
+
+    const id = newId();
+    setSessionId(id);
+    rememberLastSession(name, id, needsWorkspace(name) ? workspace : "");
     if (!needsWorkspace(name)) setShowGate(false);
     else if (!workspace) setShowGate(true);
   };
@@ -431,6 +504,7 @@ export function App() {
           ) : (
             <>
               <Transcript items={items} onApprove={approve} />
+              {running && !streaming && !lastItemIsAssistant(items) && <WaitingForAgent />}
               {streaming && (
                 <div className="transcript">
                   <div className="bubble-assistant">
@@ -492,8 +566,9 @@ export function App() {
 function itemsFromMessages(messages: any[]): Item[] {
   const items: Item[] = [];
   for (const m of messages || []) {
-    if (m.role === "user" && typeof m.content === "string") {
-      items.push({ kind: "user", text: m.content });
+    if (m.role === "user") {
+      const user = userItemFromContent(m.content);
+      if (user.text || user.attachments?.length) items.push(user);
     } else if (m.role === "assistant") {
       if (m.content) items.push({ kind: "assistant", text: m.content });
       for (const tc of m.tool_calls || []) {
@@ -509,6 +584,46 @@ function itemsFromMessages(messages: any[]): Item[] {
     // system + tool-result messages are omitted from the visual replay
   }
   return items;
+}
+
+function userItemFromContent(content: any): Extract<Item, { kind: "user" }> {
+  if (typeof content === "string") return { kind: "user", text: content };
+  if (!Array.isArray(content)) return { kind: "user", text: "" };
+
+  const text: string[] = [];
+  const attachments: Attachment[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && part.text) {
+      text.push(String(part.text));
+    } else if (part.type === "image_url") {
+      const url = part.image_url?.url;
+      if (typeof url === "string" && url.startsWith("data:image/")) {
+        attachments.push({ kind: "image", name: "image", data_url: url });
+      }
+    }
+  }
+  return { kind: "user", text: text.join("\n\n"), attachments };
+}
+
+function lastItemIsAssistant(items: Item[]): boolean {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.kind === "notice") continue;
+    return item.kind === "assistant";
+  }
+  return false;
+}
+
+function WaitingForAgent() {
+  return (
+    <div className="transcript">
+      <div className="waiting-row" aria-live="polite">
+        <span className="waiting-spinner" />
+        <span>Waiting for agent...</span>
+      </div>
+    </div>
+  );
 }
 
 function updateLastTool(items: Item[], name: string, status: string, preview?: string): Item[] {
